@@ -1,16 +1,14 @@
 {
-  "name": "qualiconsult-ai-whatsapp-bot",
+  "name": "qualiconsult-telegram-bot",
   "version": "1.0.0",
-  "private": true,
+  "type": "module",
   "main": "index.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
-  },
-  "engines": {
-    "node": ">=18"
+    "express": "^4.19.2",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^17.2.3"
   }
 }
