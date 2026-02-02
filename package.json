@@ -13,3 +13,18 @@
     "express": "^4.19.2"
   }
 }
+{
+  "name": "qualiconsult-telegram-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
