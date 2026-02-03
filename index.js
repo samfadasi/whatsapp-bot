@@ -17,6 +17,10 @@ const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
 
+// مهم: الدومين الأساسي (حطّه في Railway Variables)
+// مثال: https://whatsapp-bot-production-70a1.up.railway.app
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim();
+
 const TG_API = TELEGRAM_BOT_TOKEN
   ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
   : "";
@@ -27,6 +31,7 @@ console.log("BOT_NAME:", BOT_NAME);
 console.log("TELEGRAM_BOT_TOKEN:", TELEGRAM_BOT_TOKEN ? "OK" : "MISSING");
 console.log("OPENAI_API_KEY:", OPENAI_API_KEY ? "OK" : "MISSING");
 console.log("OPENAI_MODEL:", OPENAI_MODEL);
+console.log("PUBLIC_BASE_URL:", PUBLIC_BASE_URL || "MISSING");
 console.log("=========================");
 
 // =====================
@@ -35,11 +40,38 @@ console.log("=========================");
 const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 // =====================
-// Static files (Excel downloads)
+// Files
 // =====================
 const FILES_DIR = path.join(process.cwd(), "public", "files");
 fs.mkdirSync(FILES_DIR, { recursive: true });
-app.use("/files", express.static(path.join(process.cwd(), "public", "files")));
+
+// بدل static: نعمل تنزيل مباشر
+app.get("/files/:name", (req, res) => {
+  try {
+    const name = req.params.name;
+    const safe = path.basename(name); // منع path traversal
+    const filePath = path.join(FILES_DIR, safe);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).send("File not found");
+    }
+
+    // إجبار المتصفح ينزّل
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${safe}"`
+    );
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+
+    return res.sendFile(filePath);
+  } catch (e) {
+    console.error("Download error:", e);
+    return res.status(500).send("Download error");
+  }
+});
 
 // =====================
 // Telegram helpers
@@ -64,13 +96,21 @@ function splitTelegram(text) {
   return parts;
 }
 
-async function tgSend(chatId, text) {
+async function tgSend(chatId, text, opts = {}) {
   if (!TG_API) return false;
+
+  const payload = {
+    chat_id: chatId,
+    text,
+    ...opts,
+  };
+
   const resp = await fetch(`${TG_API}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(payload),
   });
+
   const body = await resp.text();
   console.log("📤 Telegram send:", resp.status, body);
   return resp.ok;
@@ -80,6 +120,14 @@ async function tgSendMany(chatId, text) {
   for (const p of splitTelegram(text)) {
     await tgSend(chatId, p);
   }
+}
+
+// إرسال رابط clickable مضمون
+async function tgSendLink(chatId, url, label = "⬇️ تنزيل ملف Excel") {
+  // HTML mode: clickable link
+  const safeUrl = url.replace(/"/g, "%22");
+  const html = `${label}: <a href="${safeUrl}">اضغط هنا</a>`;
+  await tgSend(chatId, html, { parse_mode: "HTML", disable_web_page_preview: true });
 }
 
 // =====================
@@ -171,7 +219,6 @@ function isShortFollowup(t) {
 async function generateAuditExcel() {
   const wb = new ExcelJS.Workbook();
 
-  // -------- Sheet 1: Checklist --------
   const s1 = wb.addWorksheet("Audit Checklist");
   s1.columns = [
     { header: "Area / البند", key: "area", width: 28 },
@@ -185,27 +232,26 @@ async function generateAuditExcel() {
   s1.addRows([
     {
       area: "Raw Materials / المواد الخام",
-      q: "Are raw materials approved and inspected?",
+      q: "Are raw materials approved and inspected? / هل المواد الخام معتمدة ويتم فحصها؟",
       req: "GMP / HACCP",
     },
     {
       area: "Storage / التخزين",
-      q: "Are storage temperature and hygiene controlled?",
+      q: "Are storage temperature and hygiene controlled? / هل يتم ضبط حرارة التخزين والنظافة؟",
       req: "GMP",
     },
     {
       area: "Production / الإنتاج",
-      q: "Are SOPs followed during production?",
+      q: "Are SOPs followed during production? / هل يتم الالتزام بإجراءات التشغيل؟",
       req: "ISO 9001 / HACCP",
     },
     {
       area: "Cleaning / النظافة",
-      q: "Is cleaning and sanitation program implemented?",
+      q: "Is sanitation program implemented? / هل برنامج التنظيف والتعقيم مطبق؟",
       req: "GMP",
     },
   ]);
 
-  // -------- Sheet 2: Action Plan --------
   const s2 = wb.addWorksheet("Action Plan");
   s2.columns = [
     { header: "Finding Ref / رقم الملاحظة", key: "ref", width: 22 },
@@ -229,11 +275,16 @@ async function generateAuditExcel() {
   return filename;
 }
 
+function absoluteUrl(relativePath) {
+  if (!PUBLIC_BASE_URL) return relativePath; // fallback
+  return `${PUBLIC_BASE_URL.replace(/\/+$/, "")}${relativePath}`;
+}
+
 // =====================
 // AI Core
 // =====================
 async function askAI(chatId, userText) {
-  if (!openai) return "❌ محرك الذكاء غير مهيأ.";
+  if (!openai) return "❌ محرك الذكاء غير مهيأ (OPENAI_API_KEY مفقود).";
 
   const session = getSession(chatId);
   const yn = normalizeYesNo(userText);
@@ -249,12 +300,17 @@ async function askAI(chatId, userText) {
   if (!cont && yn && session?.awaiting_excel) {
     if (yn === "yes") {
       const file = await generateAuditExcel();
-      const link = `/files/${file}`;
+      const rel = `/files/${file}`;
+      const full = absoluteUrl(rel);
+
       setSession(chatId, { awaiting_excel: false });
+
+      // نرجع نص مختصر، والرابط نرسله كـ clickable HTML separately
+      setSession(chatId, { last_file_url: full });
+
       return (
-        `تم إنشاء نموذج Excel (Sheetين AR+EN) ✅\n\n` +
-        `رابط التحميل:\n${link}\n\n` +
-        `هل ترغب بتعديله حسب معيار معين (ISO 22000 / BRCGS)؟`
+        `تم إنشاء نموذج Excel (Sheetين AR+EN) ✅\n` +
+        `سأرسل لك رابط تحميل مباشر الآن.`
       );
     } else {
       setSession(chatId, { awaiting_excel: false });
@@ -285,10 +341,7 @@ async function askAI(chatId, userText) {
     });
 
     const answer = (resp.output_text || "").trim();
-
-    // إذا الرد فيه checklist → اعرض خيار Excel
-    const askExcel =
-      /checklist|قائمة تحقق|مراجعة داخلية/i.test(userText);
+    const askExcel = /checklist|قائمة تحقق|مراجعة داخلية/i.test(userText);
 
     setSession(chatId, {
       last_question: userText,
@@ -297,10 +350,7 @@ async function askAI(chatId, userText) {
     });
 
     if (askExcel) {
-      return (
-        answer +
-        `\n\nهل ترغب في تحويل هذه القائمة إلى نموذج Excel (Sheetين AR+EN)؟`
-      );
+      return answer + `\n\nهل ترغب في تحويلها إلى نموذج Excel (Sheetين AR+EN)؟`;
     }
 
     return answer || "لم أتمكن من توليد رد الآن.";
@@ -318,6 +368,7 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.post("/telegram/webhook", async (req, res) => {
   res.sendStatus(200);
+
   try {
     const msg = req.body?.message;
     const chatId = msg?.chat?.id;
@@ -336,6 +387,15 @@ app.post("/telegram/webhook", async (req, res) => {
 
     const answer = await askAI(chatId, text);
     await tgSendMany(chatId, answer);
+
+    // إذا تم توليد ملف الآن، أرسل الرابط بصيغة HTML clickable
+    const s = getSession(chatId);
+    if (s?.last_file_url) {
+      const url = s.last_file_url;
+      // امسحها بعد الإرسال عشان ما تتكرر
+      setSession(chatId, { last_file_url: null });
+      await tgSendLink(chatId, url, "⬇️ تنزيل ملف Excel (Checklist + Action Plan)");
+    }
   } catch (e) {
     console.error("Webhook error:", e);
   }
