@@ -255,6 +255,7 @@ async function askAI(chatId, userText) {
     return "حدث خطأ في محرك الذكاء. جرّب تاني.";
   }
 }
+app.use("/files", express.static("public/files"));
 
 // =====================
 // Routes
