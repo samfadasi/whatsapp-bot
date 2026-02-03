@@ -1,406 +1,245 @@
 import express from "express";
-import OpenAI from "openai";
 import ExcelJS from "exceljs";
+import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "url";
+
+/* =====================
+   Basic setup
+===================== */
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(express.json());
 
-// =====================
-// ENV
-// =====================
-const PORT = Number(process.env.PORT || 8080);
-const BOT_NAME = (process.env.BOT_NAME || "QualiConsult AI").trim();
+const PORT = process.env.PORT || 8080;
+const BOT_NAME = process.env.BOT_NAME || "QualiConsult AI";
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 
-const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
-const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || "").trim();
-const OPENAI_MODEL = (process.env.OPENAI_MODEL || "gpt-4.1-mini").trim();
-
-// مهم: الدومين الأساسي (حطّه في Railway Variables)
-// مثال: https://whatsapp-bot-production-70a1.up.railway.app
-const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").trim();
-
-const TG_API = TELEGRAM_BOT_TOKEN
-  ? `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`
-  : "";
-
-console.log("=== STARTUP ENV CHECK ===");
-console.log("PORT:", PORT);
-console.log("BOT_NAME:", BOT_NAME);
-console.log("TELEGRAM_BOT_TOKEN:", TELEGRAM_BOT_TOKEN ? "OK" : "MISSING");
-console.log("OPENAI_API_KEY:", OPENAI_API_KEY ? "OK" : "MISSING");
-console.log("OPENAI_MODEL:", OPENAI_MODEL);
-console.log("PUBLIC_BASE_URL:", PUBLIC_BASE_URL || "MISSING");
-console.log("=========================");
-
-// =====================
-// OpenAI
-// =====================
-const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
-
-// =====================
-// Files
-// =====================
-const FILES_DIR = path.join(process.cwd(), "public", "files");
-fs.mkdirSync(FILES_DIR, { recursive: true });
-
-// بدل static: نعمل تنزيل مباشر
-app.get("/files/:name", (req, res) => {
-  try {
-    const name = req.params.name;
-    const safe = path.basename(name); // منع path traversal
-    const filePath = path.join(FILES_DIR, safe);
-
-    if (!fs.existsSync(filePath)) {
-      return res.status(404).send("File not found");
-    }
-
-    // إجبار المتصفح ينزّل
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${safe}"`
-    );
-    res.setHeader(
-      "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    );
-
-    return res.sendFile(filePath);
-  } catch (e) {
-    console.error("Download error:", e);
-    return res.status(500).send("Download error");
-  }
-});
-
-// =====================
-// Telegram helpers
-// =====================
-const TG_LIMIT = 3800;
-
-function splitTelegram(text) {
-  const s = (text || "").trim();
-  if (!s) return [];
-  if (s.length <= TG_LIMIT) return [s];
-  const parts = [];
-  let chunk = "";
-  for (const line of s.split("\n")) {
-    if ((chunk + "\n" + line).length > TG_LIMIT) {
-      parts.push(chunk.trim());
-      chunk = line;
-    } else {
-      chunk += (chunk ? "\n" : "") + line;
-    }
-  }
-  if (chunk.trim()) parts.push(chunk.trim());
-  return parts;
+if (!TELEGRAM_TOKEN) {
+  console.warn("⚠️ TELEGRAM_BOT_TOKEN missing");
+}
+if (!OPENAI_API_KEY) {
+  console.warn("⚠️ OPENAI_API_KEY missing");
 }
 
-async function tgSend(chatId, text, opts = {}) {
-  if (!TG_API) return false;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 
-  const payload = {
-    chat_id: chatId,
-    text,
-    ...opts,
-  };
+/* =====================
+   Helpers
+===================== */
 
-  const resp = await fetch(`${TG_API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
+// Telegram max message ≈ 4096 chars
+function splitTelegram(text, limit = 3500) {
+  const chunks = [];
+  let current = "";
+  for (const line of text.split("\n")) {
+    if ((current + line).length > limit) {
+      chunks.push(current);
+      current = "";
+    }
+    current += line + "\n";
+  }
+  if (current.trim()) chunks.push(current);
+  return chunks;
+}
+
+async function sendTelegram(chatId, text) {
+  const parts = splitTelegram(text);
+  for (const part of parts) {
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: part
+      })
+    });
+  }
+}
+
+/* =====================
+   AI logic
+===================== */
+async function askAI(userText) {
+  // Retry once فقط
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await openai.responses.create({
+        model: OPENAI_MODEL,
+        input: [
+          {
+            role: "system",
+            content:
+              "You are a senior technical consultant in Quality, Food Safety, HACCP, KPI, and Operational Excellence. " +
+              "Respond in clear Arabic primarily, with concise professional structure. " +
+              "If the answer is long, continue automatically without asking the user to say 'continue'."
+          },
+          {
+            role: "user",
+            content: userText
+          }
+        ],
+        max_output_tokens: 1200
+      });
+
+      const output =
+        response.output_text ||
+        response.output?.[0]?.content?.[0]?.text ||
+        "";
+
+      return output || "لم أتمكن من توليد رد مفيد حالياً.";
+    } catch (err) {
+      console.error(`❌ AI attempt ${attempt} failed:`, err?.message || err);
+      if (attempt === 2) throw err;
+    }
+  }
+}
+
+/* =====================
+   Excel generation
+===================== */
+async function generateExcelChecklist() {
+  const workbook = new ExcelJS.Workbook();
+
+  /* Sheet 1: Internal Audit Checklist */
+  const sheet1 = workbook.addWorksheet("Internal Audit Checklist");
+
+  sheet1.columns = [
+    { header: "No", key: "no", width: 6 },
+    { header: "البند (AR)", key: "ar", width: 40 },
+    { header: "Item (EN)", key: "en", width: 40 },
+    { header: "Compliance (Yes/No)", key: "comp", width: 20 },
+    { header: "Notes", key: "notes", width: 30 }
+  ];
+
+  const checklist = [
+    ["وجود دليل جودة محدث", "Updated quality manual available"],
+    ["إجراءات تشغيل معتمدة (SOPs)", "Approved SOPs available"],
+    ["سجلات تدريب العاملين", "Training records maintained"],
+    ["فحص واستلام المواد الخام", "Raw material inspection"],
+    ["مراقبة درجات الحرارة", "Temperature monitoring"],
+    ["نظافة وتعقيم المعدات", "Cleaning & sanitation program"],
+    ["فحص المنتج النهائي", "Final product inspection"],
+    ["إدارة المنتجات غير المطابقة", "Nonconforming product control"]
+  ];
+
+  checklist.forEach((item, idx) => {
+    sheet1.addRow({
+      no: idx + 1,
+      ar: item[0],
+      en: item[1]
+    });
   });
 
-  const body = await resp.text();
-  console.log("📤 Telegram send:", resp.status, body);
-  return resp.ok;
-}
+  /* Sheet 2: Action Plan / CAPA */
+  const sheet2 = workbook.addWorksheet("Action Plan (CAPA)");
 
-async function tgSendMany(chatId, text) {
-  for (const p of splitTelegram(text)) {
-    await tgSend(chatId, p);
-  }
-}
-
-// إرسال رابط clickable مضمون
-async function tgSendLink(chatId, url, label = "⬇️ تنزيل ملف Excel") {
-  // HTML mode: clickable link
-  const safeUrl = url.replace(/"/g, "%22");
-  const html = `${label}: <a href="${safeUrl}">اضغط هنا</a>`;
-  await tgSend(chatId, html, { parse_mode: "HTML", disable_web_page_preview: true });
-}
-
-// =====================
-// RAM Sessions (TEMP)
-// =====================
-const SESSIONS = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000;
-
-function now() {
-  return Date.now();
-}
-function getSession(chatId) {
-  const s = SESSIONS.get(String(chatId));
-  if (!s) return null;
-  if (now() - s.updated_at > SESSION_TTL_MS) {
-    SESSIONS.delete(String(chatId));
-    return null;
-  }
-  return s;
-}
-function setSession(chatId, patch) {
-  const key = String(chatId);
-  const old = SESSIONS.get(key) || {};
-  SESSIONS.set(key, { ...old, ...patch, updated_at: now() });
-}
-function resetSession(chatId) {
-  SESSIONS.delete(String(chatId));
-}
-
-// =====================
-// Prompts
-// =====================
-function systemPrompt() {
-  return `
-أنت "QualiConsult AI" مستشار تقني متخصص في:
-- الجودة (QMS / ISO 9001)
-- سلامة الغذاء (FSMS / HACCP / ISO 22000 / GMP)
-- الصحة والسلامة المهنية (OHS)
-- التميز المؤسسي
-- KPI / BSC / OKR
-- Lean / RCA / CAPA
-
-قواعد الرد:
-1) عملي مباشر، بدون حشو أو تحية متكررة.
-2) تشخيص سريع ثم خطوات تنفيذية.
-3) إذا السؤال ناقص: اسأل سؤالًا حاسمًا واحدًا فقط.
-4) عند طلب checklist / template / form: قدم نموذج جاهز.
-5) لا تعُد للبداية في المتابعة.
-6) لغة عربية مبسطة + مصطلح إنجليزي بين قوسين عند الحاجة.
-`.trim();
-}
-
-function helpText() {
-  return (
-    `مرحباً 👋 أنا ${BOT_NAME}.\n\n` +
-    `مجالاتي:\n` +
-    `• الجودة\n• سلامة الغذاء\n• HACCP\n• KPI\n• التميز المؤسسي\n• Lean\n\n` +
-    `أوامر:\n` +
-    `/help – المساعدة\n` +
-    `/reset – تصفير السياق\n\n` +
-    `أمثلة:\n` +
-    `- كيف أطبق HACCP في مخبز صغير؟\n` +
-    `- اعمل لي checklist مراجعة داخلية لقسم الجودة في مخبز\n`
-  );
-}
-
-// =====================
-// Follow-up logic
-// =====================
-function normalizeYesNo(t) {
-  const x = (t || "").trim().toLowerCase();
-  const yes = ["نعم", "ايوه", "أيوا", "تمام", "ok", "yes", "أكيد", "موافق"];
-  const no = ["لا", "no", "غير", "مش", "ما", "ابداً"];
-  if (yes.includes(x)) return "yes";
-  if (no.includes(x)) return "no";
-  return null;
-}
-function isContinue(t) {
-  const x = (t || "").trim().toLowerCase();
-  return ["اكمل", "أكمل", "كمل", "تابع", "واصل", "continue"].includes(x);
-}
-function isShortFollowup(t) {
-  return (t || "").trim().length > 0 && (t || "").trim().length <= 12;
-}
-
-// =====================
-// Excel Generator (AR + EN, 2 Sheets)
-// =====================
-async function generateAuditExcel() {
-  const wb = new ExcelJS.Workbook();
-
-  const s1 = wb.addWorksheet("Audit Checklist");
-  s1.columns = [
-    { header: "Area / البند", key: "area", width: 28 },
-    { header: "Audit Question / سؤال المراجعة", key: "q", width: 45 },
-    { header: "Requirement / المتطلب", key: "req", width: 30 },
-    { header: "Status / الحالة", key: "status", width: 18 },
-    { header: "Evidence / الدليل", key: "evidence", width: 30 },
-    { header: "Auditor Comment / ملاحظات المدقق", key: "comment", width: 30 },
+  sheet2.columns = [
+    { header: "No", key: "no", width: 6 },
+    { header: "الوصف (AR)", key: "ar", width: 40 },
+    { header: "Description (EN)", key: "en", width: 40 },
+    { header: "Root Cause", key: "cause", width: 25 },
+    { header: "Corrective Action", key: "action", width: 25 },
+    { header: "Responsible", key: "resp", width: 20 },
+    { header: "Due Date", key: "date", width: 15 }
   ];
 
-  s1.addRows([
-    {
-      area: "Raw Materials / المواد الخام",
-      q: "Are raw materials approved and inspected? / هل المواد الخام معتمدة ويتم فحصها؟",
-      req: "GMP / HACCP",
-    },
-    {
-      area: "Storage / التخزين",
-      q: "Are storage temperature and hygiene controlled? / هل يتم ضبط حرارة التخزين والنظافة؟",
-      req: "GMP",
-    },
-    {
-      area: "Production / الإنتاج",
-      q: "Are SOPs followed during production? / هل يتم الالتزام بإجراءات التشغيل؟",
-      req: "ISO 9001 / HACCP",
-    },
-    {
-      area: "Cleaning / النظافة",
-      q: "Is sanitation program implemented? / هل برنامج التنظيف والتعقيم مطبق؟",
-      req: "GMP",
-    },
-  ]);
+  for (let i = 1; i <= 5; i++) {
+    sheet2.addRow({ no: i });
+  }
 
-  const s2 = wb.addWorksheet("Action Plan");
-  s2.columns = [
-    { header: "Finding Ref / رقم الملاحظة", key: "ref", width: 22 },
-    { header: "Non-Conformity / عدم المطابقة", key: "nc", width: 40 },
-    { header: "Root Cause / السبب الجذري", key: "rc", width: 30 },
-    { header: "Corrective Action / الإجراء التصحيحي", key: "ca", width: 35 },
-    { header: "Responsible / المسؤول", key: "resp", width: 22 },
-    { header: "Target Date / تاريخ الإغلاق", key: "date", width: 20 },
-    { header: "Status / الحالة", key: "status", width: 18 },
-    { header: "Verification / التحقق", key: "ver", width: 28 },
-  ];
+  const dir = path.join(__dirname, "public", "files");
+  fs.mkdirSync(dir, { recursive: true });
 
-  const filename = `internal_audit_bakery_${new Date()
-    .toISOString()
-    .slice(0, 10)
-    .replace(/-/g, "")}.xlsx`;
+  const filename = `audit_checklist_${Date.now()}.xlsx`;
+  const filepath = path.join(dir, filename);
 
-  const filepath = path.join(FILES_DIR, filename);
-  await wb.xlsx.writeFile(filepath);
-
+  await workbook.xlsx.writeFile(filepath);
   return filename;
 }
 
-function absoluteUrl(relativePath) {
-  if (!PUBLIC_BASE_URL) return relativePath; // fallback
-  return `${PUBLIC_BASE_URL.replace(/\/+$/, "")}${relativePath}`;
-}
+/* =====================
+   Routes
+===================== */
 
-// =====================
-// AI Core
-// =====================
-async function askAI(chatId, userText) {
-  if (!openai) return "❌ محرك الذكاء غير مهيأ (OPENAI_API_KEY مفقود).";
+app.get("/", (req, res) => {
+  res.send(`${BOT_NAME} running ✅`);
+});
 
-  const session = getSession(chatId);
-  const yn = normalizeYesNo(userText);
-  const cont = isContinue(userText);
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
 
-  let stitchedUserText = userText;
+// Serve files
+app.use("/files", express.static(path.join(__dirname, "public", "files")));
 
-  if (cont && session?.last_reply) {
-    stitchedUserText =
-      `أكمل من حيث توقفت:\n${session.last_reply}\n\nتابع الآن بتفاصيل عملية إضافية.`;
-  }
-
-  if (!cont && yn && session?.awaiting_excel) {
-    if (yn === "yes") {
-      const file = await generateAuditExcel();
-      const rel = `/files/${file}`;
-      const full = absoluteUrl(rel);
-
-      setSession(chatId, { awaiting_excel: false });
-
-      // نرجع نص مختصر، والرابط نرسله كـ clickable HTML separately
-      setSession(chatId, { last_file_url: full });
-
-      return (
-        `تم إنشاء نموذج Excel (Sheetين AR+EN) ✅\n` +
-        `سأرسل لك رابط تحميل مباشر الآن.`
-      );
-    } else {
-      setSession(chatId, { awaiting_excel: false });
-      return "تمام. إذا احتجت النموذج لاحقًا قل: أريد Excel.";
-    }
-  }
-
-  if (!cont && !yn && session?.last_reply && isShortFollowup(userText)) {
-    stitchedUserText =
-      `اعتبر هذه متابعة للسياق السابق:\n${session.last_reply}\n\nتابع بشكل عملي.`;
-  }
-
-  const context = [];
-  if (session?.last_question && session?.last_reply) {
-    context.push({ role: "user", content: session.last_question });
-    context.push({ role: "assistant", content: session.last_reply });
-  }
-
-  try {
-    const resp = await openai.responses.create({
-      model: OPENAI_MODEL,
-      max_output_tokens: 700,
-      input: [
-        { role: "system", content: systemPrompt() },
-        ...context,
-        { role: "user", content: stitchedUserText },
-      ],
-    });
-
-    const answer = (resp.output_text || "").trim();
-    const askExcel = /checklist|قائمة تحقق|مراجعة داخلية/i.test(userText);
-
-    setSession(chatId, {
-      last_question: userText,
-      last_reply: answer,
-      awaiting_excel: askExcel,
-    });
-
-    if (askExcel) {
-      return answer + `\n\nهل ترغب في تحويلها إلى نموذج Excel (Sheetين AR+EN)؟`;
-    }
-
-    return answer || "لم أتمكن من توليد رد الآن.";
-  } catch (e) {
-    console.error("AI error:", e);
-    return "حدث خطأ في محرك الذكاء. جرّب مرة أخرى.";
-  }
-}
-
-// =====================
-// Routes
-// =====================
-app.get("/", (req, res) => res.send(`${BOT_NAME} running ✅`));
-app.get("/health", (req, res) => res.json({ ok: true }));
-
+/**
+ * Telegram Webhook
+ * URL: https://YOUR_DOMAIN/telegram/webhook
+ */
 app.post("/telegram/webhook", async (req, res) => {
-  res.sendStatus(200);
+  res.sendStatus(200); // لازم 200 فوراً
 
   try {
+    console.log("📩 Telegram update:", JSON.stringify(req.body));
+
     const msg = req.body?.message;
     const chatId = msg?.chat?.id;
     const text = msg?.text?.trim();
+
     if (!chatId || !text) return;
 
-    if (text === "/help" || text === "/start") {
-      await tgSendMany(chatId, helpText());
-      return;
-    }
-    if (text === "/reset") {
-      resetSession(chatId);
-      await tgSend(chatId, "تم تصفير السياق ✅");
+    // Commands
+    if (text === "/start" || text === "/help") {
+      await sendTelegram(
+        chatId,
+        `مرحباً 👋 أنا ${BOT_NAME}.\n\n` +
+          `اكتب سؤالك مباشرة في:\n` +
+          `• الجودة\n• سلامة الغذاء\n• HACCP\n• KPI\n• التميز المؤسسي\n\n` +
+          `أمثلة:\n` +
+          `- كيف أطبق HACCP في مخبز صغير؟\n` +
+          `- اعمل لي checklist مراجعة داخلية لقسم الجودة في مخبز\n` +
+          `- ابني KPI dashboard outline لقسم الجودة`
+      );
       return;
     }
 
-    const answer = await askAI(chatId, text);
-    await tgSendMany(chatId, answer);
+    // Excel trigger
+    if (/نعم.*(اكسل|excel)|excel/i.test(text)) {
+      const file = await generateExcelChecklist();
+      const url = `${req.protocol}://${req.get("host")}/files/${file}`;
 
-    // إذا تم توليد ملف الآن، أرسل الرابط بصيغة HTML clickable
-    const s = getSession(chatId);
-    if (s?.last_file_url) {
-      const url = s.last_file_url;
-      // امسحها بعد الإرسال عشان ما تتكرر
-      setSession(chatId, { last_file_url: null });
-      await tgSendLink(chatId, url, "⬇️ تنزيل ملف Excel (Checklist + Action Plan)");
+      await sendTelegram(
+        chatId,
+        `⬇️ تنزيل ملف Excel (Checklist + Action Plan):\n${url}`
+      );
+      return;
     }
-  } catch (e) {
-    console.error("Webhook error:", e);
+
+    // AI answer
+    try {
+      const aiReply = await askAI(text);
+      await sendTelegram(chatId, aiReply);
+    } catch {
+      await sendTelegram(
+        chatId,
+        "حدث خطأ في محرك الذكاء. جرّب تاني."
+      );
+    }
+  } catch (err) {
+    console.error("❌ Webhook handler error:", err);
   }
 });
 
+/* =====================
+   Start server
+===================== */
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
