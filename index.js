@@ -1,97 +1,153 @@
 import express from "express";
 import OpenAI from "openai";
 
-const app = express();
-app.use(express.json());
-
+// ================== ENV ==================
 const PORT = process.env.PORT || 8080;
 const BOT_NAME = process.env.BOT_NAME || "QualiConsult AI";
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-if (!TELEGRAM_TOKEN) {
-  console.error("❌ TELEGRAM_BOT_TOKEN missing");
-  process.exit(1);
-}
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS || 450);
 
-const openai = OPENAI_KEY ? new OpenAI({ apiKey: OPENAI_KEY }) : null;
-
-app.get("/", (req, res) => res.send(`${BOT_NAME} running ✅`));
-app.get("/health", (req, res) => res.json({ ok: true, ai: !!openai, model: OPENAI_MODEL }));
-
-async function sendTelegram(chatId, text) {
-  const r = await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
-  });
-  const body = await r.text();
-  console.log("📤 sendMessage:", r.status, body);
+// ================== VALIDATION ==================
+if (!TELEGRAM_BOT_TOKEN) {
+  console.error("❌ TELEGRAM_BOT_TOKEN missing");
+}
+if (!OPENAI_API_KEY) {
+  console.error("❌ OPENAI_API_KEY missing");
 }
 
+// ================== CLIENTS ==================
+const app = express();
+app.use(express.json());
+
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+const openai = OPENAI_API_KEY
+  ? new OpenAI({ apiKey: OPENAI_API_KEY })
+  : null;
+
+// ================== ROOT & HEALTH ==================
+app.get("/", (req, res) => {
+  res.send(`${BOT_NAME} running ✅`);
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
+// ================== AI FUNCTION ==================
 async function askAI(userText) {
   if (!openai) return null;
 
-  const system = `
-You are QualiConsult AI, a practical consultant specialized in:
-Quality Management, Food Safety (HACCP), OHS, KPI/BSC, Lean.
-Write in Arabic by default (unless user asks English).
-Be concise but complete. Use numbered steps + checklists when useful.
-Avoid long intros. No fluff.
-`;
+  const systemPrompt = `
+You are QualiConsult AI.
+You are a professional consultant specialized in:
+- Quality Management
+- Food Safety (HACCP)
+- Occupational Health & Safety
+- KPIs & Balanced Scorecard
+- Lean & Continuous Improvement
 
-  const resp = await openai.responses.create({
-    model: OPENAI_MODEL,
-    input: [
-      { role: "system", content: system.trim() },
-      { role: "user", content: userText },
-    ],
-    max_output_tokens: MAX_OUTPUT_TOKENS,
-  });
+Rules:
+- Respond in Arabic by default unless user asks English
+- Give practical, structured answers
+- Use numbered steps, tables, and checklists when useful
+- Be concise but complete
+- No fluff, no emojis
+  `.trim();
 
-  // Extract text safely
-  const out = resp.output_text?.trim();
-  return out || null;
+  try {
+    const response = await openai.responses.create({
+      model: OPENAI_MODEL,
+      input: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userText }
+      ],
+      max_output_tokens: MAX_OUTPUT_TOKENS
+    });
+
+    const text = response.output_text?.trim();
+    return text || null;
+
+  } catch (err) {
+    console.error("❌ OpenAI error:", {
+      status: err?.status,
+      message: err?.message,
+      code: err?.code,
+      type: err?.type
+    });
+    return null;
+  }
 }
 
+// ================== TELEGRAM WEBHOOK ==================
 app.post("/telegram/webhook", async (req, res) => {
+  // Telegram لازم ياخد 200 فوراً
   res.sendStatus(200);
 
   try {
-    const msg = req.body?.message;
+    const update = req.body;
+    console.log("📩 Telegram update:", JSON.stringify(update));
+
+    const msg = update?.message;
     const chatId = msg?.chat?.id;
     const text = msg?.text?.trim();
 
     if (!chatId || !text) return;
 
-    console.log("📩 Telegram:", JSON.stringify({ chatId, text }));
-
-    // Commands
+    // /start or /help
     if (text === "/start" || text === "/help") {
-      await sendTelegram(
-        chatId,
-        `مرحباً 👋 أنا ${BOT_NAME}.\n\nاكتب سؤالك مباشرة في:\n• الجودة\n• سلامة الغذاء\n• HACCP\n• KPI\n• التميز المؤسسي\n\nمثال:\nكيف أطبق HACCP في مخبز صغير؟`
-      );
+      await fetch(`${TELEGRAM_API}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text:
+`مرحباً 👋 أنا ${BOT_NAME}.
+
+اكتب سؤالك مباشرة في:
+• الجودة
+• سلامة الغذاء
+• HACCP
+• KPI
+• التميز المؤسسي
+
+أمثلة:
+- كيف أطبق HACCP في مخبز صغير؟
+- اعمل لي checklist مراجعة داخلية لقسم الجودة
+- ابني KPI dashboard outline`
+        })
+      });
       return;
     }
 
-    // AI
-    const answer = await askAI(text);
-    if (answer) {
-      await sendTelegram(chatId, answer);
-      return;
-    }
+    // ===== AI ANSWER =====
+    const aiReply = await askAI(text);
 
-    // Fallback
-    await sendTelegram(chatId, "حدث خطأ في محرك الذكاء. جرّب تاني.");
+    const finalReply = aiReply
+      ? aiReply
+      : "حدث خطأ في محرك الذكاء. جرّب تاني.";
+
+    const resp = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: finalReply
+      })
+    });
+
+    const respText = await resp.text();
+    console.log("📤 Telegram send:", resp.status, respText);
+
   } catch (e) {
-    console.error("❌ webhook error:", e);
-    // best-effort: no crash
+    console.error("❌ Webhook handler error:", e);
   }
 });
 
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// ================== START ==================
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
